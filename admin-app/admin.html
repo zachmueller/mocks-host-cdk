@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>My uploads · Mocks Host</title>
+  <link rel="stylesheet" href="/app/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Mocks Host</div>
+    <nav>
+      <a href="/upload">Upload</a>
+      <a href="/admin" class="active">My uploads</a>
+      <a href="#" id="logout">Sign out</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="row">
+      <div>
+        <h1>My uploads</h1>
+        <p class="subtitle">Every upload has a permanent share link. Editing only changes the title/description.</p>
+      </div>
+      <div class="spacer"></div>
+      <button id="refresh" class="btn secondary small">Refresh</button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <div class="card" style="padding:0">
+      <table>
+        <thead>
+          <tr>
+            <th>Mockup</th>
+            <th>Share URL</th>
+            <th>Created</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div id="empty" class="empty hidden">No uploads yet. <a href="/upload">Upload one →</a></div>
+      <div id="loading" class="empty"><span class="spinner"></span> Loading…</div>
+    </div>
+  </main>
+
+  <script type="module">
+    import {
+      requireAuth, api, getConfig, shareUrl, logout,
+      el, setStatus, copyText, escapeHtml,
+    } from '/app/app.js';
+
+    const rows = el('rows');
+    const statusNode = el('status');
+    const emptyNode = el('empty');
+    const loadingNode = el('loading');
+
+    let cfg;
+
+    el('logout').addEventListener('click', (e) => { e.preventDefault(); logout(); });
+    el('refresh').addEventListener('click', () => load());
+
+    function fmtDate(iso) {
+      if (!iso) return '';
+      try { return new Date(iso).toLocaleString(); } catch { return iso; }
+    }
+
+    function render(items) {
+      rows.innerHTML = '';
+      loadingNode.classList.add('hidden');
+      if (!items.length) { emptyNode.classList.remove('hidden'); return; }
+      emptyNode.classList.add('hidden');
+
+      for (const item of items) {
+        const url = shareUrl(cfg, item.uid);
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>
+            <div class="title">${escapeHtml(item.title || item['original-filename'] || item.uid)}</div>
+            ${item.description ? `<div class="desc">${escapeHtml(item.description)}</div>` : ''}
+            <div class="meta mono">${escapeHtml(item.uid)} · ${escapeHtml(item['original-filename'] || '')}</div>
+          </td>
+          <td><a href="${url}" target="_blank" rel="noopener" class="mono">${escapeHtml(url)}</a></td>
+          <td class="note">${escapeHtml(fmtDate(item['created-at']))}</td>
+          <td class="actions">
+            <button class="btn small secondary" data-act="copy" data-url="${escapeHtml(url)}">Copy</button>
+            <button class="btn small secondary" data-act="edit" data-uid="${escapeHtml(item.uid)}">Edit</button>
+            <button class="btn small danger" data-act="delete" data-uid="${escapeHtml(item.uid)}">Delete</button>
+          </td>`;
+        rows.appendChild(tr);
+      }
+    }
+
+    let current = [];
+
+    async function load() {
+      loadingNode.classList.remove('hidden');
+      statusNode.className = 'status';
+      try {
+        await requireAuth();
+        cfg = cfg || (await getConfig());
+        const { items } = await api('list', {});
+        current = items;
+        render(items);
+      } catch (err) {
+        loadingNode.classList.add('hidden');
+        setStatus(statusNode, 'err', err.message || String(err));
+      }
+    }
+
+    rows.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-act]');
+      if (!btn) return;
+      const act = btn.dataset.act;
+
+      if (act === 'copy') {
+        const ok = await copyText(btn.dataset.url);
+        const prev = btn.textContent;
+        btn.textContent = ok ? 'Copied!' : 'Failed';
+        setTimeout(() => (btn.textContent = prev), 1200);
+        return;
+      }
+
+      const uid = btn.dataset.uid;
+      const item = current.find((i) => i.uid === uid);
+
+      if (act === 'edit') {
+        const title = prompt('Title:', item?.title || '');
+        if (title === null) return;
+        const description = prompt('Description:', item?.description || '');
+        if (description === null) return;
+        btn.disabled = true;
+        try {
+          await api('edit', { uid, title: title || null, description: description || null });
+          await load();
+        } catch (err) {
+          setStatus(statusNode, 'err', err.message || String(err));
+          btn.disabled = false;
+        }
+        return;
+      }
+
+      if (act === 'delete') {
+        if (!confirm(`Delete ${uid}? This permanently breaks its share link.`)) return;
+        btn.disabled = true;
+        try {
+          await api('delete', { uid });
+          await load();
+        } catch (err) {
+          setStatus(statusNode, 'err', err.message || String(err));
+          btn.disabled = false;
+        }
+      }
+    });
+
+    load();
+  </script>
+</body>
+</html>

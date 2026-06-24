@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Upload · Mocks Host</title>
+  <link rel="stylesheet" href="/app/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Mocks Host</div>
+    <nav>
+      <a href="/upload" class="active">Upload</a>
+      <a href="/admin">My uploads</a>
+      <a href="#" id="logout">Sign out</a>
+    </nav>
+  </header>
+
+  <main>
+    <h1>Upload a mockup</h1>
+    <p class="subtitle">A single <span class="mono">.html</span> file, or a <span class="mono">.zip</span> of html/js/css/assets. Max 50&nbsp;MB.</p>
+
+    <div class="card">
+      <label for="file">File</label>
+      <input type="file" id="file" accept=".html,.htm,.zip,text/html,application/zip" />
+
+      <label for="title">Title <span class="note">(optional)</span></label>
+      <input type="text" id="title" placeholder="Checkout flow v2" maxlength="200" />
+
+      <label for="description">Description <span class="note">(optional)</span></label>
+      <textarea id="description" placeholder="What is this mock for?" maxlength="2000"></textarea>
+
+      <div class="row" style="margin-top:18px">
+        <button id="upload" class="btn" disabled>Upload</button>
+        <span class="note" id="filenote"></span>
+      </div>
+
+      <div id="status" class="status"></div>
+
+      <div id="share" class="share">
+        <span>Share URL:</span>
+        <a id="shareLink" href="#" target="_blank" rel="noopener"></a>
+        <div class="spacer"></div>
+        <button id="copy" class="btn small secondary">Copy</button>
+      </div>
+    </div>
+  </main>
+
+  <script type="module">
+    import {
+      requireAuth, api, getConfig, shareUrl, logout,
+      el, setStatus, copyText,
+    } from '/app/app.js';
+
+    const MAX_BYTES = 50 * 1024 * 1024;
+
+    const fileInput = el('file');
+    const titleInput = el('title');
+    const descInput = el('description');
+    const uploadBtn = el('upload');
+    const fileNote = el('filenote');
+    const statusNode = el('status');
+    const share = el('share');
+    const shareLink = el('shareLink');
+    const copyBtn = el('copy');
+
+    let cfg;
+    (async () => {
+      await requireAuth();
+      cfg = await getConfig();
+    })();
+
+    el('logout').addEventListener('click', (e) => { e.preventDefault(); logout(); });
+
+    fileInput.addEventListener('change', () => {
+      share.className = 'share';
+      statusNode.className = 'status';
+      const f = fileInput.files[0];
+      if (!f) { uploadBtn.disabled = true; fileNote.textContent = ''; return; }
+      if (f.size > MAX_BYTES) {
+        uploadBtn.disabled = true;
+        fileNote.textContent = `${(f.size / 1048576).toFixed(1)} MB — exceeds the 50 MB limit.`;
+        return;
+      }
+      uploadBtn.disabled = false;
+      fileNote.textContent = `${f.name} · ${(f.size / 1024).toFixed(0)} KB`;
+    });
+
+    async function pollStatus(uid) {
+      // Poll the near-live status object until ready or error (~90s budget).
+      const deadline = Date.now() + 90000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const res = await fetch(`/status/${uid}.json`, { cache: 'no-store' });
+        if (res.ok) {
+          const body = await res.json();
+          if (body.status === 'ready') return { ok: true };
+          if (body.status === 'error') return { ok: false, error: body.error };
+        }
+      }
+      return { ok: false, error: 'Timed out waiting for processing.' };
+    }
+
+    uploadBtn.addEventListener('click', async () => {
+      const f = fileInput.files[0];
+      if (!f) return;
+      uploadBtn.disabled = true;
+      share.className = 'share';
+      setStatus(statusNode, 'info', '<span class="spinner"></span> Requesting upload URL…');
+
+      try {
+        // 1. Ask the API for a presigned PUT + a fresh UID.
+        const { uid, uploadUrl } = await api('presign', {
+          filename: f.name,
+          title: titleInput.value.trim() || null,
+          description: descInput.value.trim() || null,
+        });
+
+        // 2. PUT the bytes straight to S3.
+        setStatus(statusNode, 'info', '<span class="spinner"></span> Uploading…');
+        const put = await fetch(uploadUrl, { method: 'PUT', body: f });
+        if (!put.ok) throw new Error(`Upload failed (${put.status})`);
+
+        // 3. Poll for processing to finish.
+        setStatus(statusNode, 'info', '<span class="spinner"></span> Processing…');
+        const result = await pollStatus(uid);
+        if (!result.ok) {
+          setStatus(statusNode, 'err', `Processing failed: ${result.error}`);
+          uploadBtn.disabled = false;
+          return;
+        }
+
+        // 4. Success — reveal the share URL.
+        const url = shareUrl(cfg, uid);
+        setStatus(statusNode, 'ok', 'Done! Your mockup is live.');
+        shareLink.textContent = url;
+        shareLink.href = url;
+        share.className = 'share show';
+      } catch (err) {
+        setStatus(statusNode, 'err', err.message || String(err));
+        uploadBtn.disabled = false;
+      }
+    });
+
+    copyBtn.addEventListener('click', async () => {
+      const ok = await copyText(shareLink.textContent);
+      copyBtn.textContent = ok ? 'Copied!' : 'Copy failed';
+      setTimeout(() => (copyBtn.textContent = 'Copy'), 1500);
+    });
+  </script>
+</body>
+</html>

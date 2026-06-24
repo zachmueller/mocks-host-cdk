@@ -1,0 +1,21 @@
+*.js
+!jest.config.js
+!admin-app/**/*.js
+# CloudFront Function sources are hand-written .js, not build output.
+!lib/cloudfront-functions/*.js
+*.d.ts
+node_modules
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+
+# Local env / secrets
+.env
+cdk.context.json
+config.local.json
+cdk-outputs.json
+
+# OS / editor
+.DS_Store
+*.log
