@@ -14,24 +14,24 @@ serverless, and low-ops: CloudFront + S3 + a single Lambda + Cognito.
 ## Architecture
 
 ```
-                              ┌─────────────────────────────────────────┐
+                              ┌───────────────────────────────────────────┐
    browser (admin app) ──────▶│ CloudFront (one distribution, OAC)        │
                               │  /                → 302 /login            │
                               │  /login /admin /upload → app/*.html       │
                               │  /app/*           → admin SPA + config    │
                               │  /status/*        → status JSON (~5s TTL) │
-                              │  /<UID>/*         → mock assets (1yr TTL)  │
+                              │  /<UID>/*         → mock assets (1yr TTL) │
                               └───────────────┬───────────────────────────┘
                                               │ OAC (private)
-                                       ┌──────▼───────┐
+                                       ┌──────▼────────┐
                                        │ assets bucket │  <uid>/  app/  status/
-                                       └──────▲───────┘
+                                       └──────▲────────┘
    browser ──presigned PUT──▶ staging bucket ─┘ (S3 event, prefix uploads/)
         ▲                          │
         │                          ▼
-   HTTP API (Cognito JWT)   ┌──────────────┐    ┌────────────────┐
-   presign/list/edit/delete │  Lambda      │───▶│ metadata bucket │ metadata.json
-        └───────────────────▶│ (handler.ts) │    └────────────────┘
+   HTTP API (Cognito JWT)    ┌──────────────┐    ┌─────────────────┐
+   presign/list/edit/delete  │  Lambda      │───▶│ metadata bucket │ metadata.json
+        └───────────────────▶│ (handler.ts) │    └─────────────────┘
                              └──────────────┘
 ```
 
