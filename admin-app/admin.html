@@ -32,6 +32,7 @@
       <table>
         <thead>
           <tr>
+            <th class="thumbcol"></th>
             <th>Mockup</th>
             <th>Share URL</th>
             <th>Created</th>
@@ -66,6 +67,36 @@
       try { return new Date(iso).toLocaleString(); } catch { return iso; }
     }
 
+    // `preview` and `pages` only exist on multi-page bundles uploaded after
+    // gallery support landed; every render path has to tolerate their absence.
+    function thumbCell(item, url) {
+      if (!item.preview) return '<td class="thumbcol"></td>';
+      const src = `${url}/${item.preview}`;
+      return `<td class="thumbcol"><a href="${escapeHtml(url)}" target="_blank" rel="noopener">
+        <img class="thumb" src="${escapeHtml(src)}" alt="" loading="lazy"></a></td>`;
+    }
+
+    function pagesBlock(item, url) {
+      const pages = item.pages || [];
+      if (!pages.length) return '';
+      // The slug, not the group, is the disambiguator here: a bundle can hold two
+      // pages with the same display name, and the slug is what ends up in the URL.
+      const rows = pages.map((p) => {
+        const pageUrl = `${url}/${p.slug}`;
+        return `<li>
+          <span class="pagetext">
+            <a href="${escapeHtml(pageUrl)}" target="_blank" rel="noopener" title="${escapeHtml(p.group || '')}">${escapeHtml(p.name)}</a>
+            <span class="slug mono">/${escapeHtml(p.slug)}</span>
+          </span>
+          <button class="btn small secondary" data-act="copy" data-url="${escapeHtml(pageUrl)}">Copy</button>
+        </li>`;
+      }).join('');
+      return `<details class="pages">
+        <summary>${pages.length} page${pages.length === 1 ? '' : 's'}</summary>
+        <ul>${rows}</ul>
+      </details>`;
+    }
+
     function render(items) {
       rows.innerHTML = '';
       loadingNode.classList.add('hidden');
@@ -76,10 +107,12 @@
         const url = shareUrl(cfg, item.uid);
         const tr = document.createElement('tr');
         tr.innerHTML = `
+          ${thumbCell(item, url)}
           <td>
             <div class="title">${escapeHtml(item.title || item['original-filename'] || item.uid)}</div>
             ${item.description ? `<div class="desc">${escapeHtml(item.description)}</div>` : ''}
             <div class="meta mono">${escapeHtml(item.uid)} · ${escapeHtml(item['original-filename'] || '')}</div>
+            ${pagesBlock(item, url)}
           </td>
           <td><a href="${url}" target="_blank" rel="noopener" class="mono">${escapeHtml(url)}</a></td>
           <td class="note">${escapeHtml(fmtDate(item['created-at']))}</td>

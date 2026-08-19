@@ -8,7 +8,8 @@
  *    ALLOWED_EMAILS allowlist (defense in depth behind the JWT authorizer).
  *  - S3 `OBJECT_CREATED` event (staging bucket, prefix `uploads/`) -> processor:
  *    sniff zip vs single HTML, unzip, strip a common top-level dir, pick the
- *    entrypoint, reject zip-slip, write assets under `<uid>/`, then always write
+ *    entrypoint (or generate a gallery index for a multi-page bundle), reject
+ *    zip-slip, write assets under `<uid>/`, then always write
  *    `status/<uid>.json` (and upsert metadata on success only).
  *
  * Reserved concurrency = 1 on this function serializes every metadata.json
@@ -16,10 +17,13 @@
  *
  * The pure helpers (`generateUid`, `processBundle`, `contentTypeFor`,
  * `isUnsafePath`, `stripCommonTopLevelDir`) carry the interesting logic and are
- * exported for unit testing without any AWS mocking.
+ * exported for unit testing without any AWS mocking. The multi-page gallery
+ * logic lives in `./gallery`, and Content-Type resolution in `./media-type`.
  */
 import { randomBytes } from 'node:crypto';
 import { unzipSync } from 'fflate';
+import { buildGallery, type GalleryMeta, type PageEntry } from './gallery';
+import { contentTypeForEntry } from './media-type';
 import {
   S3Client,
   GetObjectCommand,
@@ -46,40 +50,30 @@ const UPLOAD_PREFIX = 'uploads/';
 const META_PREFIX = 'meta/';
 const STATUS_PREFIX = 'status/';
 
-/** Guards against zip bombs in the processor. */
-const MAX_TOTAL_DECOMPRESSED_BYTES = 200 * 1024 * 1024; // 200 MB
+/**
+ * Guards against zip bombs. Both are enforced from the unzip *filter*, against
+ * sizes read from the central directory, so an oversized archive is rejected
+ * before any of it is inflated into memory.
+ */
+const MAX_TOTAL_DECOMPRESSED_BYTES = 400 * 1024 * 1024; // 400 MB
 const MAX_FILE_COUNT = 5000;
 
-const CONTENT_TYPES: Record<string, string> = {
-  html: 'text/html; charset=utf-8',
-  htm: 'text/html; charset=utf-8',
-  css: 'text/css; charset=utf-8',
-  js: 'text/javascript; charset=utf-8',
-  mjs: 'text/javascript; charset=utf-8',
-  json: 'application/json; charset=utf-8',
-  map: 'application/json; charset=utf-8',
-  svg: 'image/svg+xml',
-  png: 'image/png',
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  gif: 'image/gif',
-  webp: 'image/webp',
-  avif: 'image/avif',
-  ico: 'image/x-icon',
-  woff: 'font/woff',
-  woff2: 'font/woff2',
-  ttf: 'font/ttf',
-  otf: 'font/otf',
-  eot: 'application/vnd.ms-fontobject',
-  txt: 'text/plain; charset=utf-8',
-  xml: 'application/xml; charset=utf-8',
-  webmanifest: 'application/manifest+json',
-  pdf: 'application/pdf',
-  mp4: 'video/mp4',
-  webm: 'video/webm',
-  mp3: 'audio/mpeg',
-  wasm: 'application/wasm',
-};
+/**
+ * Ceiling on the raw upload. The admin UI caps the file picker at 50 MB, but a
+ * presigned PUT has no size limit of its own, so the processor re-checks the
+ * object size from the S3 event before pulling the bytes into memory.
+ */
+const MAX_UPLOAD_BYTES = 60 * 1024 * 1024; // 60 MB
+
+/**
+ * Editor and OS cruft that routinely rides along in a hand-zipped folder.
+ * Dropped before decompression so it costs neither memory nor an S3 object.
+ */
+const JUNK_ENTRY =
+  /(?:^|\/)(?:__MACOSX\/|\.DS_Store$|Thumbs\.db$|desktop\.ini$|\.git\/|\.svn\/|\._)/i;
+
+/** Concurrent PutObject calls while writing a processed bundle. */
+const PUT_CONCURRENCY = 12;
 
 const IMMUTABLE_CACHE = 'public, max-age=31536000, immutable';
 const NO_CACHE = 'no-cache';
@@ -110,12 +104,9 @@ export function generateUid(): string {
   return uid;
 }
 
-/** Content-Type for a path, by extension; octet-stream when unknown. */
-export function contentTypeFor(path: string): string {
-  const dot = path.lastIndexOf('.');
-  const ext = dot === -1 ? '' : path.slice(dot + 1).toLowerCase();
-  return CONTENT_TYPES[ext] ?? 'application/octet-stream';
-}
+// Content-Type resolution lives in ./media-type; re-exported here because it is
+// part of this module's tested surface.
+export { contentTypeFor, sniffContentType, contentTypeForEntry } from './media-type';
 
 /**
  * Reject paths that would escape the `<uid>/` prefix (zip-slip): absolute
@@ -172,18 +163,42 @@ export function looksLikeZip(data: Uint8Array): boolean {
   );
 }
 
+/** Page summary recorded in metadata.json so the admin app can deep-link. */
+export interface PageSummary {
+  slug: string;
+  name: string;
+  group: string;
+}
+
 export interface ProcessedBundle {
   files: Record<string, Uint8Array>;
   entrypoint: string; // always 'index.html'
+  /**
+   * Explicit Content-Type for generated objects, keyed by path. Slug redirect
+   * stubs are extension-less, so the type must be stated rather than inferred.
+   */
+  contentTypes?: Record<string, string>;
+  /** Present only for a generated gallery; absent for single-page bundles. */
+  pages?: PageSummary[];
+  /** Key of the bundle preview image under `<uid>/`, when one was found. */
+  preview?: string | null;
 }
 
 /**
  * Turn a raw upload into the set of files to write under `<uid>/`.
  *
  * - Single (non-zip) upload -> served as `index.html`.
- * - Zip -> unzip, drop directory entries, strip a common top-level dir, then
- *   pick the entrypoint: top-level `index.html`, else the sole `.html` anywhere
- *   (also copied to `index.html` so `/<uid>` resolves), else throw.
+ * - Zip -> unzip (dropping directory entries and OS cruft), strip a common
+ *   top-level dir, reject zip-slip, then resolve the entrypoint:
+ *
+ *     top-level index.html   -> serve it as-is
+ *     exactly one .html      -> promote it to index.html so `/<uid>` resolves
+ *     no .html at all        -> throw
+ *     2+ .html, no index     -> generate a gallery index + slug redirects
+ *
+ * The last branch is what makes design-tool exports shareable: they carry
+ * several independently-viewable pages and no entry page, and used to be
+ * rejected outright.
  *
  * Throws a human-readable Error on any condition that should surface to the
  * uploader as a `status: "error"`.
@@ -191,6 +206,7 @@ export interface ProcessedBundle {
 export function processBundle(
   originalFilename: string,
   data: Uint8Array,
+  meta: Partial<Omit<GalleryMeta, 'originalFilename'>> = {},
 ): ProcessedBundle {
   if (!data || data.length === 0) {
     throw new Error('Uploaded file is empty.');
@@ -201,9 +217,33 @@ export function processBundle(
     return { files: { 'index.html': data }, entrypoint: 'index.html' };
   }
 
+  // Enforce the zip-bomb guards from inside the filter: `originalSize` comes
+  // from the central directory, so an oversized archive is rejected before it
+  // is inflated. A cap trip is recorded rather than thrown, because throwing
+  // here would be swallowed by the "could not read the archive" wrapper below.
+  let capError: string | null = null;
+  let entryCount = 0;
+  let totalBytes = 0;
   let unzipped: Record<string, Uint8Array>;
   try {
-    unzipped = unzipSync(data);
+    unzipped = unzipSync(data, {
+      filter: (file) => {
+        if (capError) return false;
+        if (file.name.endsWith('/')) return false; // directory entry
+        if (JUNK_ENTRY.test(file.name)) return false;
+        entryCount++;
+        totalBytes += file.originalSize;
+        if (entryCount > MAX_FILE_COUNT) {
+          capError = `The .zip archive has too many files (over ${MAX_FILE_COUNT}).`;
+          return false;
+        }
+        if (totalBytes > MAX_TOTAL_DECOMPRESSED_BYTES) {
+          capError = 'The .zip archive is too large when decompressed.';
+          return false;
+        }
+        return true;
+      },
+    });
   } catch (err) {
     throw new Error(
       `Could not read the .zip archive${
@@ -211,23 +251,18 @@ export function processBundle(
       }: ${(err as Error).message}`,
     );
   }
+  if (capError) throw new Error(capError);
 
-  // Drop directory entries (keys ending in '/') and empty placeholders.
+  // The filter already dropped directory entries; re-check defensively, since a
+  // zip can describe a directory without the trailing-slash convention.
   const fileEntries: Record<string, Uint8Array> = {};
-  let totalBytes = 0;
   for (const [path, content] of Object.entries(unzipped)) {
     if (path.endsWith('/')) continue;
     fileEntries[path] = content;
-    totalBytes += content.length;
   }
 
-  const count = Object.keys(fileEntries).length;
-  if (count === 0) throw new Error('The .zip archive contains no files.');
-  if (count > MAX_FILE_COUNT) {
-    throw new Error(`The .zip archive has too many files (${count}).`);
-  }
-  if (totalBytes > MAX_TOTAL_DECOMPRESSED_BYTES) {
-    throw new Error('The .zip archive is too large when decompressed.');
+  if (Object.keys(fileEntries).length === 0) {
+    throw new Error('The .zip archive contains no usable files.');
   }
 
   const stripped = stripCommonTopLevelDir(fileEntries);
@@ -241,23 +276,52 @@ export function processBundle(
 
   // Entrypoint cascade.
   const files: Record<string, Uint8Array> = { ...stripped };
-  if (!files['index.html']) {
-    const htmls = Object.keys(files).filter((p) => /\.html?$/i.test(p));
-    if (htmls.length === 1) {
-      files['index.html'] = files[htmls[0]];
-    } else if (htmls.length === 0) {
-      throw new Error(
-        'No HTML file found in the archive. Include an index.html (or a single .html file).',
-      );
-    } else {
-      throw new Error(
-        'Multiple HTML files found and none is a top-level index.html. ' +
-          'Name your entry page index.html.',
-      );
-    }
+  if (files['index.html']) return { files, entrypoint: 'index.html' };
+
+  const htmls = Object.keys(files).filter((p) => /\.html?$/i.test(p));
+  if (htmls.length === 0) {
+    throw new Error(
+      'No HTML file found in the archive. Include an index.html (or a single .html file).',
+    );
+  }
+  if (htmls.length === 1) {
+    files['index.html'] = files[htmls[0]];
+    return { files, entrypoint: 'index.html' };
   }
 
-  return { files, entrypoint: 'index.html' };
+  // Multi-page bundle: synthesize the landing page the export never had.
+  const gallery = buildGallery(stripped, {
+    uid: meta.uid ?? '',
+    title: meta.title ?? null,
+    description: meta.description ?? null,
+    originalFilename,
+    shareBaseUrl: meta.shareBaseUrl ?? '',
+  });
+
+  const contentTypes: Record<string, string> = {
+    'index.html': 'text/html; charset=utf-8',
+  };
+  files['index.html'] = Buffer.from(gallery.indexHtml, 'utf-8');
+  for (const [slug, html] of Object.entries(gallery.stubs)) {
+    files[slug] = Buffer.from(html, 'utf-8');
+    contentTypes[slug] = 'text/html; charset=utf-8';
+  }
+  // Copy (by reference — no extra bytes) the preview to a stable, typed key.
+  if (gallery.previewSource && gallery.previewKey) {
+    files[gallery.previewKey] = stripped[gallery.previewSource];
+  }
+
+  return {
+    files,
+    entrypoint: 'index.html',
+    contentTypes,
+    pages: gallery.pages.map((p: PageEntry) => ({
+      slug: p.slug,
+      name: p.name,
+      group: p.group,
+    })),
+    preview: gallery.previewKey,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +395,13 @@ interface MetadataEntry {
   description: string | null;
   'original-filename': string;
   'created-at': string;
+  /**
+   * Multi-page bundle extras. All optional: entries written before gallery
+   * support existed have none of them, and the admin app must render without.
+   */
+  pages?: PageSummary[];
+  preview?: string | null;
+  'file-count'?: number;
 }
 type Metadata = Record<string, MetadataEntry>;
 
@@ -434,6 +505,47 @@ interface Sidecar {
   originalFilename: string;
 }
 
+/**
+ * Write every processed file under `<uid>/` with bounded concurrency.
+ *
+ * A design export is dozens of objects (and two of them can be 7.6 MB), which
+ * a serial loop turns into minutes of round-trips. This is SDK concurrency
+ * inside one invocation and is unrelated to the account's Lambda concurrency
+ * limit.
+ */
+async function writeBundle(
+  bucket: string,
+  uid: string,
+  bundle: ProcessedBundle,
+): Promise<void> {
+  const entries = Object.entries(bundle.files);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++;
+      if (i >= entries.length) return;
+      const [path, content] = entries[i];
+      await s3().send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: `${uid}/${path}`,
+          Body: content,
+          ContentType: bundle.contentTypes?.[path] ?? contentTypeForEntry(path, content),
+          CacheControl: IMMUTABLE_CACHE,
+        }),
+      );
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(PUT_CONCURRENCY, entries.length) }, worker),
+  );
+}
+
+/** Public origin for absolute URLs in generated pages (og:image). */
+function shareBaseUrl(): string {
+  return (process.env.SHARE_BASE_URL ?? '').replace(/\/+$/, '');
+}
+
 async function handleS3Event(event: any): Promise<void> {
   const staging = env('STAGING_BUCKET');
   const assets = env('ASSETS_BUCKET');
@@ -446,25 +558,31 @@ async function handleS3Event(event: any): Promise<void> {
 
     let originalFilename = decodedKey.split('/').slice(2).join('/') || 'upload';
     try {
+      // Reject an oversized object from its event metadata, before the bytes are
+      // ever pulled into memory. The browser caps the picker at 50 MB, but the
+      // presigned PUT itself has no size limit.
+      const uploadedBytes: number = record.s3.object.size ?? 0;
+      if (uploadedBytes > MAX_UPLOAD_BYTES) {
+        throw new Error(
+          `Upload is too large (${Math.round(uploadedBytes / 1048576)} MB); ` +
+            `the limit is ${MAX_UPLOAD_BYTES / 1048576} MB.`,
+        );
+      }
+
       // Sidecar with title/description/filename written by `presign`.
       const sidecar = await readJson<Sidecar>(staging, `${META_PREFIX}${uid}.json`);
       if (sidecar?.originalFilename) originalFilename = sidecar.originalFilename;
 
       const data = await readBytes(staging, decodedKey);
-      const { files } = processBundle(originalFilename, data);
+      const bundle = processBundle(originalFilename, data, {
+        uid,
+        title: sidecar?.title ?? null,
+        description: sidecar?.description ?? null,
+        shareBaseUrl: shareBaseUrl(),
+      });
 
       // Write every processed file under <uid>/ with a 1-year immutable cache.
-      for (const [path, content] of Object.entries(files)) {
-        await s3().send(
-          new PutObjectCommand({
-            Bucket: assets,
-            Key: `${uid}/${path}`,
-            Body: content,
-            ContentType: contentTypeFor(path),
-            CacheControl: IMMUTABLE_CACHE,
-          }),
-        );
-      }
+      await writeBundle(assets, uid, bundle);
 
       // Success: mark ready, then upsert metadata (last, per design).
       await writeJson(assets, `${STATUS_PREFIX}${uid}.json`, { status: 'ready' }, NO_CACHE);
@@ -476,6 +594,9 @@ async function handleS3Event(event: any): Promise<void> {
           description: sidecar?.description ?? null,
           'original-filename': originalFilename,
           'created-at': new Date().toISOString(),
+          ...(bundle.pages?.length ? { pages: bundle.pages } : {}),
+          ...(bundle.preview ? { preview: bundle.preview } : {}),
+          'file-count': Object.keys(bundle.files).length,
         };
       });
     } catch (err) {

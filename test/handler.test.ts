@@ -1,13 +1,15 @@
 /**
  * Unit tests for the pure processor/helper logic in the Lambda handler.
- * No AWS mocking — exercises generateUid, contentTypeFor, isUnsafePath,
- * commonTopLevelDir/stripCommonTopLevelDir, looksLikeZip, and the full
- * processBundle entrypoint cascade with fflate-built zip fixtures.
+ * No AWS mocking — exercises generateUid, contentTypeFor/sniffContentType,
+ * isUnsafePath, commonTopLevelDir/stripCommonTopLevelDir, looksLikeZip, and the
+ * full processBundle entrypoint cascade with fflate-built zip fixtures.
  */
 import { zipSync, strToU8 } from 'fflate';
 import {
   generateUid,
   contentTypeFor,
+  sniffContentType,
+  contentTypeForEntry,
   isUnsafePath,
   commonTopLevelDir,
   stripCommonTopLevelDir,
@@ -25,6 +27,13 @@ function makeZip(files: Record<string, string>): Uint8Array {
 }
 
 const decode = (u: Uint8Array) => Buffer.from(u).toString('utf-8');
+
+/** Minimal valid-enough headers for the magic-byte sniffer. */
+const WEBP = new Uint8Array([
+  0x52, 0x49, 0x46, 0x46, 0x10, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+]);
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0]);
 
 describe('generateUid', () => {
   it('produces 8-symbol uppercase Crockford base32', () => {
@@ -49,10 +58,59 @@ describe('contentTypeFor', () => {
     ['photo.JPG', 'image/jpeg'],
     ['font.woff2', 'font/woff2'],
     ['data.json', 'application/json; charset=utf-8'],
+    ['shot.webp', 'image/webp'],
+    ['readme.md', 'text/markdown; charset=utf-8'],
+    ['page.dc.html', 'text/html; charset=utf-8'],
     ['weird.bin', 'application/octet-stream'],
     ['noext', 'application/octet-stream'],
   ])('%s -> %s', (path, expected) => {
     expect(contentTypeFor(path)).toBe(expected);
+  });
+
+  // Design-system exports ship unbuilt sources next to the bundle. Serving them
+  // as text/javascript would make them executable via <script src>.
+  it.each(['Button.jsx', 'types.ts', 'App.tsx'])('%s is inert text/plain', (path) => {
+    expect(contentTypeFor(path)).toBe('text/plain; charset=utf-8');
+  });
+});
+
+describe('sniffContentType', () => {
+  it.each([
+    [WEBP, 'image/webp'],
+    [PNG, 'image/png'],
+    [JPEG, 'image/jpeg'],
+    [strToU8('GIF89a...'), 'image/gif'],
+    [strToU8('<svg xmlns="http://www.w3.org/2000/svg"></svg>'), 'image/svg+xml'],
+    [strToU8('  <!DOCTYPE HTML><h1>hi</h1>'), 'text/html; charset=utf-8'],
+  ])('recognizes %#', (data, expected) => {
+    expect(sniffContentType(data)).toBe(expected);
+  });
+
+  it.each([strToU8('just some prose'), new Uint8Array([1, 2]), new Uint8Array()])(
+    'returns null for unrecognized input %#',
+    (data) => {
+      expect(sniffContentType(data)).toBeNull();
+    },
+  );
+});
+
+describe('contentTypeForEntry', () => {
+  it('prefers the extension when it is known', () => {
+    // Contents disagree with the name; the name wins.
+    expect(contentTypeForEntry('a.css', PNG)).toBe('text/css; charset=utf-8');
+  });
+
+  it('sniffs extension-less files rather than serving octet-stream', () => {
+    // A Design Composer export ships its workspace preview as `.thumbnail`,
+    // which is really a WebP. As octet-stream a browser downloads it.
+    expect(contentTypeFor('.thumbnail')).toBe('application/octet-stream');
+    expect(contentTypeForEntry('.thumbnail', WEBP)).toBe('image/webp');
+  });
+
+  it('falls back to octet-stream when neither name nor bytes are recognizable', () => {
+    expect(contentTypeForEntry('blob', new Uint8Array([7, 7, 7, 7]))).toBe(
+      'application/octet-stream',
+    );
   });
 });
 
@@ -159,11 +217,6 @@ describe('processBundle', () => {
     expect(() => processBundle('nohtml.zip', zip)).toThrow(/No HTML/i);
   });
 
-  it('errors on multiple HTML files with no top-level index.html', () => {
-    const zip = makeZip({ 'a.html': '<h1>a</h1>', 'b.html': '<h1>b</h1>' });
-    expect(() => processBundle('multi.zip', zip)).toThrow(/Multiple HTML/i);
-  });
-
   it('prefers top-level index.html even when other html files exist', () => {
     const zip = makeZip({
       'index.html': '<h1>main</h1>',
@@ -171,6 +224,8 @@ describe('processBundle', () => {
     });
     const out = processBundle('multi.zip', zip);
     expect(decode(out.files['index.html'])).toContain('main');
+    // An author-supplied entry page is never second-guessed with a gallery.
+    expect(out.pages).toBeUndefined();
   });
 
   it('rejects a zip-slip attempt', () => {
@@ -181,6 +236,108 @@ describe('processBundle', () => {
       '../evil.html': '<h1>evil</h1>',
     });
     expect(() => processBundle('evil.zip', zip)).toThrow(/Unsafe path/i);
+  });
+
+  it('drops OS and editor cruft before it costs memory or an S3 object', () => {
+    const zip = makeZip({
+      'index.html': '<h1>ok</h1>',
+      '__MACOSX/._index.html': 'junk',
+      '.DS_Store': 'junk',
+      'assets/Thumbs.db': 'junk',
+      'assets/._logo.png': 'junk',
+      '.git/config': 'junk',
+    });
+    const out = processBundle('macos.zip', zip);
+    expect(Object.keys(out.files)).toEqual(['index.html']);
+  });
+
+  it('rejects an archive with too many entries', () => {
+    // Enforced from the unzip filter against the central directory, so the
+    // archive is rejected without inflating it. The decompressed-byte cap uses
+    // the same mechanism.
+    const many: Record<string, string> = { 'index.html': '<h1>x</h1>' };
+    for (let i = 0; i < 5001; i++) many[`f${i}.txt`] = 'x';
+    expect(() => processBundle('many.zip', makeZip(many))).toThrow(/too many files/i);
+  });
+});
+
+describe('processBundle — multi-page bundles (generated gallery)', () => {
+  it('generates a gallery index instead of rejecting a multi-page zip', () => {
+    // This shape — several pages, no index.html — used to be a hard error and is
+    // exactly what a design-tool workspace export looks like.
+    const zip = makeZip({
+      'Alpha Page.html': '<h1>alpha</h1>',
+      'Beta Page.html': '<h1>beta</h1>',
+      'style.css': 'body{}',
+    });
+    const out = processBundle('export.zip', zip);
+
+    expect(out.pages?.map((p) => p.slug)).toEqual(['alpha-page', 'beta-page']);
+    const index = decode(out.files['index.html']);
+    expect(index).toContain('<!doctype html>');
+    expect(index).toContain('Alpha Page');
+    expect(index).toContain('Beta Page');
+    expect(out.contentTypes?.['index.html']).toBe('text/html; charset=utf-8');
+  });
+
+  it('keeps the original pages untouched and adds slug redirects beside them', () => {
+    const zip = makeZip({ 'One.html': '<h1>1</h1>', 'Two.html': '<h1>2</h1>' });
+    const out = processBundle('export.zip', zip);
+
+    // Originals are byte-identical: an export's runtime resolves siblings by
+    // their real filenames, so renaming or dropping them breaks the pages.
+    expect(decode(out.files['One.html'])).toBe('<h1>1</h1>');
+    expect(decode(out.files['Two.html'])).toBe('<h1>2</h1>');
+
+    // Slugs are separate, extension-less objects that redirect.
+    expect(decode(out.files['one'])).toContain('One.html');
+    expect(out.contentTypes?.['one']).toBe('text/html; charset=utf-8');
+  });
+
+  it('exposes an extension-less preview image at a typed key', () => {
+    const entries: Record<string, Uint8Array> = {
+      'a.html': strToU8('<h1>a</h1>'),
+      'b.html': strToU8('<h1>b</h1>'),
+      '.thumbnail': WEBP,
+    };
+    const out = processBundle('export.zip', zipSync(entries));
+    expect(out.preview).toBe('_preview.webp');
+    expect(out.files['_preview.webp']).toEqual(WEBP);
+    expect(out.files['.thumbnail']).toEqual(WEBP); // original still served
+    expect(decode(out.files['index.html'])).toContain('src="_preview.webp"');
+  });
+
+  it('emits og:image only when it can build an absolute URL', () => {
+    const entries: Record<string, Uint8Array> = {
+      'a.html': strToU8('<h1>a</h1>'),
+      'b.html': strToU8('<h1>b</h1>'),
+      '.thumbnail': WEBP,
+    };
+    const zip = zipSync(entries);
+
+    const withDomain = processBundle('e.zip', zip, {
+      uid: 'ABCD1234',
+      shareBaseUrl: 'https://mocks.example.com',
+    });
+    expect(decode(withDomain.files['index.html'])).toContain(
+      'content="https://mocks.example.com/ABCD1234/_preview.webp"',
+    );
+
+    // No domain configured: a relative og:image would be useless to a crawler.
+    expect(decode(processBundle('e.zip', zip).files['index.html'])).not.toContain(
+      'og:image',
+    );
+  });
+
+  it('carries the upload title and description into the page', () => {
+    const zip = makeZip({ 'a.html': '<h1>a</h1>', 'b.html': '<h1>b</h1>' });
+    const out = processBundle('export.zip', zip, {
+      title: 'Passport concepts',
+      description: 'Round 3 review',
+    });
+    const index = decode(out.files['index.html']);
+    expect(index).toContain('<title>Passport concepts</title>');
+    expect(index).toContain('Round 3 review');
   });
 });
 

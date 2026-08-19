@@ -130,6 +130,61 @@ td .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
 .actions { white-space: nowrap; }
 .actions .btn { margin-right: 6px; }
 
+/* Multi-page bundles: a preview thumbnail and an expandable page list. Both are
+   absent on single-file uploads, so the column simply renders empty. */
+.thumbcol { width: 84px; padding-right: 0; }
+img.thumb {
+  display: block;
+  width: 72px;
+  height: 48px;
+  object-fit: cover;
+  object-position: center top;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+details.pages { margin-top: 8px; }
+details.pages summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  width: fit-content;
+}
+details.pages summary:hover { color: var(--text); }
+details.pages ul {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0 0 0 2px;
+  display: grid;
+  gap: 4px;
+}
+/* The column is narrow and page names are long, so the name and its slug stack
+   instead of competing for the same line. */
+details.pages li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 2px 0;
+}
+details.pages .pagetext { flex: 1; min-width: 0; }
+details.pages li a {
+  display: block;
+  font-size: 13px;
+  color: var(--accent);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+details.pages li a:hover { text-decoration: underline; }
+details.pages li .slug {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+details.pages li .btn { flex: none; margin: 0; }
+
 .center { min-height: 70vh; display: flex; align-items: center; justify-content: center; }
 .login-card { text-align: center; max-width: 380px; }
 .login-card h1 { margin-bottom: 8px; }

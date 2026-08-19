@@ -56,6 +56,25 @@ describe('MocksHostStack', () => {
     });
   });
 
+  it('gives the processor a full vCPU and headroom for a decompressed bundle', () => {
+    // 1769 MB == 1 vCPU. The processor holds an archive plus its decompressed
+    // contents in memory and writes dozens of objects concurrently.
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      MemorySize: 1769,
+      Timeout: 120,
+    });
+  });
+
+  it('passes the public origin to the handler for absolute URLs in galleries', () => {
+    // Generated gallery pages need an absolute og:image for link unfurls, and
+    // the Lambda has no other way to learn the domain it is served from.
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Environment: {
+        Variables: Match.objectLike({ SHARE_BASE_URL: Match.anyValue() }),
+      },
+    });
+  });
+
   it('does not reserve Lambda concurrency (correctness comes from conditional writes)', () => {
     const fns = template.findResources('AWS::Lambda::Function');
     for (const fn of Object.values(fns)) {

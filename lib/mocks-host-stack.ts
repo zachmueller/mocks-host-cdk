@@ -259,7 +259,11 @@ export class MocksHostStack extends Stack {
       entry: path.join(__dirname, 'lambda', 'handler.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
-      memorySize: 512,
+      // 1769 MB == one full vCPU. The processor holds a whole archive plus its
+      // decompressed contents in memory, and writes dozens of objects
+      // concurrently; 512 MB both risked an OOM against the decompressed-size
+      // cap and throttled the writes to a fraction of a core.
+      memorySize: 1769,
       timeout: Duration.minutes(2),
       // Metadata.json read-modify-writes are serialized by S3 conditional
       // writes (optimistic concurrency with retry) inside the handler, so no
@@ -272,6 +276,10 @@ export class MocksHostStack extends Stack {
         METADATA_KEY,
         ALLOWED_EMAILS: allowedEmails,
         DISTRIBUTION_ID: distribution.distributionId,
+        // Absolute origin for og:image in generated gallery pages. Baked into
+        // each gallery at processing time, so galleries generated before a
+        // custom domain is added keep pointing at the CloudFront domain.
+        SHARE_BASE_URL: `https://${customDomain || cloudFrontDomain}`,
       },
       bundling: {
         // fflate is bundled; AWS SDK v3 is provided by the Node 20 runtime.

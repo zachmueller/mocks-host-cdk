@@ -18,7 +18,17 @@
 
   <main>
     <h1>Upload a mockup</h1>
-    <p class="subtitle">A single <span class="mono">.html</span> file, or a <span class="mono">.zip</span> of html/js/css/assets. Max 50&nbsp;MB.</p>
+    <p class="subtitle">
+      A single <span class="mono">.html</span> file, or a <span class="mono">.zip</span> of
+      html/js/css/assets. Max 50&nbsp;MB.
+    </p>
+    <p class="subtitle">
+      Zips with several pages and no <span class="mono">index.html</span> — a whole design-tool
+      workspace export, for instance — get a generated index listing every page, so
+      <span class="mono">/&lt;id&gt;</span> opens a gallery and each page also gets its own tidy
+      link. A zip that already has a top-level <span class="mono">index.html</span> is served
+      exactly as-is.
+    </p>
 
     <div class="card">
       <label for="file">File</label>
